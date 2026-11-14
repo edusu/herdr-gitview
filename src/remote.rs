@@ -99,7 +99,7 @@ const MEASURE_BATCH: usize = 200;
 /// link's target (a target ending in a newline loses it, as `$(…)` does).
 macro_rules! worktree_sh {
     () => {
-        r#"kind() { k=M; d=$1; while case $d in */*) d=${d%/*};; *) false;; esac; do [ -L "$d" ] && return; done; if [ -L "$1" ]; then k=L; elif [ -f "$1" ]; then k=F; fi; }
+        r#"kind() { k=M; case /$1/ in //*|*/../*) return;; esac; d=$1; while case $d in */*) d=${d%/*};; *) false;; esac; do [ -L "$d" ] && return; done; if [ -L "$1" ]; then k=L; elif [ -f "$1" ]; then k=F; fi; }
 target() { t=$(readlink -- "$1") || return 1; printf %s "$t"; }
 "#
     };
@@ -229,6 +229,44 @@ const MEASURE: &str = concat!(
 echo '--links--'; [ $# -eq 0 ] || wc -c -- "$@" 2>/dev/null; echo '--gitview--'; [ $# -eq 0 ] || grep -H -c -I -e '' -- "$@" 2>/dev/null; exit 0"#
 );
 
+/// Open a regular worktree file without following any relative symlinks.
+fn open_worktree_file(dir: &Path, path: &Path) -> Result<Option<std::fs::File>> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut file = std::fs::File::open(dir)?;
+    let mut parts = path.components().peekable();
+    while let Some(part) = parts.next() {
+        let name = match part {
+            Component::Normal(name) => CString::new(name.as_bytes())?,
+            Component::CurDir => continue,
+            _ => bail!("worktree path must be relative and contain no parent components"),
+        };
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if parts.peek().is_some() {
+                libc::O_DIRECTORY
+            } else {
+                0
+            };
+        // SAFETY: file owns a live directory descriptor and name is NUL-terminated.
+        let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP) => Ok(None),
+                _ => Err(error).with_context(|| format!("opening {}", path.display())),
+            };
+        }
+        // SAFETY: openat returned a new descriptor, owned only by this File.
+        file = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(file.metadata()?.is_file().then_some(file))
+}
+
 impl Machine {
     /// `--on` as given: `None` or `""` is this machine.
     pub fn parse(on: Option<&str>) -> Machine {
@@ -302,16 +340,23 @@ impl Machine {
     }
 
     /// The bytes of the file `path` (relative to `dir`) there; `None` when
-    /// there's no such file. Here any read error counts as missing (as the
-    /// TUI always had it); there, only a missing file does, and a failed
-    /// call is an error (not a deleted file).
+    /// there's nothing to read (see [`WorktreeEntry`]); a symlink reads as its
+    /// target text. Other read failures are errors, never a deleted file.
     pub fn read(&self, dir: &Path, path: &Path) -> Result<Option<Vec<u8>>> {
         match self {
-            Machine::Local => Ok(match worktree_entry(dir, path) {
-                WorktreeEntry::Missing => None,
-                WorktreeEntry::Link(target) => Some(target),
-                WorktreeEntry::File(full, _) => std::fs::read(full).ok(),
-            }),
+            Machine::Local => match worktree_entry(dir, path) {
+                WorktreeEntry::Missing => Ok(None),
+                WorktreeEntry::Link(target) => Ok(Some(target)),
+                WorktreeEntry::File(..) => {
+                    use std::io::Read;
+                    let Some(mut file) = open_worktree_file(dir, path)? else {
+                        return Ok(None);
+                    };
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes)?;
+                    Ok(Some(bytes))
+                }
+            },
             Machine::On(m) => {
                 let name = path.to_string_lossy();
                 let cmd =
@@ -339,9 +384,13 @@ impl Machine {
                 WorktreeEntry::Missing => Ok(Contents::Missing),
                 WorktreeEntry::Link(target) => Ok(Contents::at_most(target, max)),
                 WorktreeEntry::File(_, len) if len > max => Ok(Contents::TooBig(len)),
-                WorktreeEntry::File(full, _) => {
-                    let bytes = std::fs::read(&full)
-                        .with_context(|| format!("reading {}", full.display()))?;
+                WorktreeEntry::File(..) => {
+                    use std::io::Read;
+                    let Some(file) = open_worktree_file(dir, path)? else {
+                        return Ok(Contents::Missing);
+                    };
+                    let mut bytes = Vec::new();
+                    file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
                     Ok(Contents::at_most(bytes, max)) // it may have grown meanwhile
                 }
             },

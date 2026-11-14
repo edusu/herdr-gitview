@@ -263,3 +263,32 @@ fn a_path_or_side_outside_the_file_is_refused() {
     }
     let _ = std::fs::remove_file(&outside);
 }
+
+#[test]
+fn worktree_previews_do_not_follow_file_or_directory_symlinks() {
+    use std::os::unix::fs::symlink;
+    let repo = fixture("file-symlinks");
+    let dir = &repo.dir;
+    write(dir, ".git/outside/doc.md", "PRIVATE_PREVIEW_SENTINEL");
+    write(dir, "inside.md", "internal content");
+    symlink(dir.join(".git/outside/doc.md"), dir.join("outside.md")).unwrap();
+    symlink(dir.join(".git/outside"), dir.join("linked-dir")).unwrap();
+    symlink("inside.md", dir.join("linked-inside.md")).unwrap();
+    symlink("missing-target", dir.join("dangling.md")).unwrap();
+    for path in [
+        "outside.md",
+        "linked-dir/doc.md",
+        "linked-inside.md",
+        "dangling.md",
+    ] {
+        let v = file(dir, &["--path", path]);
+        if path == "linked-dir/doc.md" {
+            assert_eq!(v["kind"], "missing", "{path}: {v}");
+        }
+        assert!(!v.to_string().contains("PRIVATE_PREVIEW_SENTINEL"));
+    }
+    assert_eq!(
+        file(dir, &["--path", "inside.md"])["text"],
+        "internal content"
+    );
+}

@@ -103,7 +103,7 @@ build() {
   else
     command -v cargo >/dev/null 2>&1 || die "cargo not found (https://rustup.rs), or set GITVIEW_BIN"
     say "building (cargo build --release)…"
-    (cd "$ROOT" && cargo build --release --quiet)
+    (cd "$ROOT" && cargo build --release --locked --quiet)
     BIN_SRC="$ROOT/target/release/herdr-gitview"
   fi
   [ -x "$BIN_SRC" ] || die "no binary at $BIN_SRC"
@@ -151,8 +151,7 @@ done
 # half-copied mod) filled a long-running app's JS memory in a day of
 # installs: then every reload failed with Null"null". An unchanged mod
 # isn't touched (no reload at all).
-STAGE="$HOME_DIR/mods/.gitview-install"
-rm -rf "$STAGE" && mkdir -p "$STAGE"
+STAGE="$(mktemp -d "$HOME_DIR/mods/.gitview-install.XXXXXX")"
 for m in "${MODS[@]}"; do
   cp -RL "$ROOT/herdr-app/mods/$m" "$STAGE/$m" # -L: shared files are links in the repo
 done
@@ -173,7 +172,12 @@ for m in "${MODS[@]}"; do
   if [ -d "$HOME_DIR/mods/$m" ]; then mv "$HOME_DIR/mods/$m" "$STAGE/.old-$m"; fi
   mv "$STAGE/$m" "$HOME_DIR/mods/$m"
 done
-rm -rf "$STAGE"
+if ! rmdir "$STAGE" 2>/dev/null; then
+  BACKUPS="$HOME_DIR/data/gitview/install-backups"
+  mkdir -p "$BACKUPS"
+  mv "$STAGE" "$BACKUPS/$(basename "$STAGE")"
+  say "previous mods and unused staging files kept in $BACKUPS/$(basename "$STAGE")"
+fi
 say "mods: ${CHANGED[*]:-none changed}"
 
 # --- keys and layout -----------------------------------------------------------------

@@ -32,6 +32,10 @@ def log(kind, data):
 args = sys.argv[1:]
 if args[:1] != ["connect"]:
     log("argv", args)
+    if os.environ.get("FAKE_HC_ECHO"):
+        print(args[2])
+        print(args[2], file=sys.stderr)
+        sys.exit(int(os.environ.get("FAKE_HC_FAIL", "0")))
     print("{}")
     sys.exit(0)
 inp, out = sys.stdin.buffer, sys.stdout.buffer
@@ -200,4 +204,31 @@ fn submitting_uses_hc_send() {
     );
     assert!(entries(&log, "attach").is_empty());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn submitted_notes_never_reach_debug_logs_or_error_replies() {
+    let (dir, hc) = setup("redacted");
+    let marker = "PRIVATE_NOTE_SENTINEL";
+    for fail in ["0", "1"] {
+        let out = common::gitview()
+            .args(["json", "send", "--terminal", "t9", "--submit", "--", marker])
+            .env("GITVIEW_HC", &hc)
+            .env("FAKE_HC_LOG", dir.join("hc.log"))
+            .env("FAKE_HC_ECHO", "1")
+            .env("FAKE_HC_FAIL", fail)
+            .env("HERDR_PLUGIN_STATE_DIR", dir.join("state"))
+            .env("GITVIEW_TRACE", dir.join("trace.jsonl"))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.success(), fail == "0");
+        for text in [
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            std::fs::read_to_string(dir.join("state/debug.log")).unwrap(),
+            std::fs::read_to_string(dir.join("trace.jsonl")).unwrap(),
+        ] {
+            assert!(!text.contains(marker), "private note leaked: {text}");
+        }
+    }
 }
