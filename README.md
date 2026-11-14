@@ -82,6 +82,27 @@ window to "add the mod at github.com/ChmaraX/herdr-gitview".
 - **Uninstall:** the same command with `--uninstall`; the stock Changes
   panel comes back.
 
+### Install a local fork
+
+With Herdr running, build and install the checked-out branch:
+
+```bash
+cargo build --release --locked
+bash herdr-app/install.sh --binary "$PWD/target/release/herdr-gitview"
+```
+
+The installer copies the binary and mods into the Herdr app home, validates
+mods, and sets up the Changes panel and free key bindings. Run it again after
+rebuilding to update the installed copy. Replaced mod folders are retained under
+`data/gitview/install-backups/` in the app home. The root `install.sh` downloads upstream
+releases; use the local installer to keep your fork's changes.
+
+Worktree diffs and previews do not follow symbolic links, including links to
+other files inside the repository. Historical and staged content is read from
+Git objects. Remote reads reject symlinks before reading, but the remote shell
+cannot prevent a path being replaced concurrently; do not use remote previews
+as a sandbox for an actively hostile filesystem.
+
 ## Quick start
 
 1. **Open it.** Press **Changes** in the tab bar, or `cmd-shift-g`. The

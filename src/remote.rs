@@ -5,7 +5,7 @@
 //! checks which machine it is on.
 
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
 
@@ -83,7 +83,17 @@ const MEASURE_BATCH: usize = 200;
 
 /// Exit code of [`READ`] for a file that isn't there.
 const MISSING: i32 = 44;
-const READ: &str = r#"[ -e "$1" ] || exit 44; exec cat -- "$1""#;
+// shortcut: remote shell checks cannot prevent concurrent path replacement; use
+// descriptor-relative reads when a remote helper is available.
+const CHECK_PATH: &str = r#"p=$1; case "$p" in /*) exit 44;; esac
+part=.
+while [ -n "$p" ]; do
+  name=${p%%/*}; case "$name" in ..) exit 44;; esac
+  part=$part/$name; [ ! -L "$part" ] || exit 44
+  case "$p" in */*) p=${p#*/};; *) break;; esac
+done
+"#;
+const READ: &str = r#"[ -f "$1" ] || exit 44; exec cat -- "$1""#;
 
 /// Exit code of [`READ_AT_MOST`] for a file over the limit (its size on
 /// stdout).
@@ -104,6 +114,44 @@ pub enum Contents {
 /// gives sizes, `grep -c -I` counts lines (an unterminated last one too)
 /// and gives 0 for a binary file. Rust lines the answers up by name.
 const MEASURE: &str = r#"wc -c -- "$@" 2>/dev/null; echo '--gitview--'; grep -H -c -I -e '' -- "$@" 2>/dev/null; exit 0"#;
+
+/// Open a regular worktree file without following any relative symlinks.
+fn open_worktree_file(dir: &Path, path: &Path) -> Result<Option<std::fs::File>> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut file = std::fs::File::open(dir)?;
+    let mut parts = path.components().peekable();
+    while let Some(part) = parts.next() {
+        let name = match part {
+            Component::Normal(name) => CString::new(name.as_bytes())?,
+            Component::CurDir => continue,
+            _ => bail!("worktree path must be relative and contain no parent components"),
+        };
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if parts.peek().is_some() {
+                libc::O_DIRECTORY
+            } else {
+                0
+            };
+        // SAFETY: file owns a live directory descriptor and name is NUL-terminated.
+        let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP) => Ok(None),
+                _ => Err(error).with_context(|| format!("opening {}", path.display())),
+            };
+        }
+        // SAFETY: openat returned a new descriptor, owned only by this File.
+        file = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(file.metadata()?.is_file().then_some(file))
+}
 
 impl Machine {
     /// `--on` as given: `None` or `""` is this machine.
@@ -178,16 +226,24 @@ impl Machine {
     }
 
     /// The bytes of the file `path` (relative to `dir`) there; `None` when
-    /// there's no such file. Here any read error counts as missing (as the
-    /// TUI always had it); there, only a missing file does, and a failed
-    /// call is an error (not a deleted file).
+    /// there's no regular file or the path contains a symlink. Other read
+    /// failures are errors, never a deleted file.
     pub fn read(&self, dir: &Path, path: &Path) -> Result<Option<Vec<u8>>> {
         match self {
-            Machine::Local => Ok(std::fs::read(dir.join(path)).ok()),
+            Machine::Local => {
+                use std::io::Read;
+                let Some(mut file) = open_worktree_file(dir, path)? else {
+                    return Ok(None);
+                };
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                Ok(Some(bytes))
+            }
             Machine::On(m) => {
                 let name = path.to_string_lossy();
+                let script = format!("{CHECK_PATH}{READ}");
                 let cmd =
-                    Machine::hc_exec(m, dir, Run::default(), &["sh", "-c", READ, "sh", &name]);
+                    Machine::hc_exec(m, dir, Run::default(), &["sh", "-c", &script, "sh", &name]);
                 let out = self.output(cmd, "a file read")?;
                 match out.status.code() {
                     Some(0) => Ok(Some(out.stdout)),
@@ -208,27 +264,26 @@ impl Machine {
     pub fn read_at_most(&self, dir: &Path, path: &Path, max: u64) -> Result<Contents> {
         match self {
             Machine::Local => {
-                let full = dir.join(path);
-                let Ok(meta) = std::fs::metadata(&full) else {
+                use std::io::Read;
+                let Some(file) = open_worktree_file(dir, path)? else {
                     return Ok(Contents::Missing);
                 };
-                if !meta.is_file() {
-                    return Ok(Contents::Missing);
+                let size = file.metadata()?.len();
+                if size > max {
+                    return Ok(Contents::TooBig(size));
                 }
-                if meta.len() > max {
-                    return Ok(Contents::TooBig(meta.len()));
-                }
-                let bytes =
-                    std::fs::read(&full).with_context(|| format!("reading {}", full.display()))?;
+                let mut bytes = Vec::new();
+                file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
                 Ok(match bytes.len() as u64 {
-                    n if n > max => Contents::TooBig(n), // grew meanwhile
+                    n if n > max => Contents::TooBig(n),
                     _ => Contents::Bytes(bytes),
                 })
             }
             Machine::On(m) => {
                 let name = path.to_string_lossy();
                 let max = max.to_string();
-                let argv = ["sh", "-c", READ_AT_MOST, "sh", &name, &max];
+                let script = format!("{CHECK_PATH}{READ_AT_MOST}");
+                let argv = ["sh", "-c", &script, "sh", &name, &max];
                 let out = self.output(
                     Machine::hc_exec(m, dir, Run::default(), &argv),
                     "a file read",

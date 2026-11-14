@@ -198,7 +198,7 @@ impl Repo {
     /// locks being off and needs its index auto-refresh off too (see
     /// branch_changes for what that costs). Writes (add, restore) still lock.
     fn git_command(&self, args: &[&str], run: Run) -> Command {
-        let mut argv = vec!["-c", "diff.autoRefreshIndex=false"];
+        let mut argv = vec!["--literal-pathspecs", "-c", "diff.autoRefreshIndex=false"];
         argv.extend(args);
         self.machine.git(&self.root, &argv, run)
     }

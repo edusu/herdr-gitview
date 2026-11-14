@@ -925,3 +925,42 @@ fn the_trace_counts_each_round_trip_to_the_machine() {
         "git {git} of {trips} trips (scripts too)"
     );
 }
+
+#[test]
+fn symlink_reads_are_refused_here_and_on_the_machine() {
+    use std::os::unix::fs::symlink;
+    let w = world("symlink-reads");
+    for dir in [&w.here, &w.remote_real] {
+        write(dir, ".git/outside/doc.md", b"PRIVATE_REMOTE_SENTINEL");
+        symlink(dir.join(".git/outside/doc.md"), dir.join("link.md")).unwrap();
+        symlink(dir.join(".git/outside"), dir.join("linked-dir")).unwrap();
+    }
+    for path in ["link.md", "linked-dir/doc.md"] {
+        assert_eq!(w.both(&["file", "--path", path])["kind"], "missing");
+        let diff = w.both(&["diff", "--path", path, "--kind", "untracked"]);
+        assert!(!diff.to_string().contains("PRIVATE_REMOTE_SENTINEL"));
+    }
+}
+
+#[test]
+fn literal_paths_only_change_the_selected_file_on_the_machine() {
+    let w = world("literal-paths");
+    for dir in [&w.here, &w.remote_real] {
+        write(dir, "a*.txt", b"original\n");
+        write(dir, "abc.txt", b"original\n");
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "literal names"]);
+        write(dir, "a*.txt", b"changed\n");
+        write(dir, "abc.txt", b"changed\n");
+    }
+    w.both(&["stage", "a*.txt"]);
+    let status = w.both(&["status"]);
+    assert!(paths(&status, "staged").contains(&"a*.txt".to_string()));
+    assert!(!paths(&status, "staged").contains(&"abc.txt".to_string()));
+    w.both(&["unstage", "a*.txt"]);
+    w.both(&["discard", "--section", "changes", "a*.txt"]);
+    for dir in [&w.here, &w.remote_real] {
+        assert_eq!(std::fs::read(dir.join("a*.txt")).unwrap(), b"original\n");
+        assert_eq!(std::fs::read(dir.join("abc.txt")).unwrap(), b"changed\n");
+    }
+}

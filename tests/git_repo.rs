@@ -867,3 +867,36 @@ fn a_write_waits_out_another_gits_index_lock() {
     held.join().unwrap();
     assert_eq!(t.repo.staged_count().unwrap(), 1);
 }
+
+#[test]
+fn selected_paths_are_literal_for_stage_unstage_and_discard() {
+    for (i, name) in ["a*.txt", "a?.txt", "a[bc].txt", ":(glob)*.txt"]
+        .iter()
+        .enumerate()
+    {
+        let t = fixture(&format!("literal-path-{i}"));
+        for path in [*name, "abc.txt"] {
+            write(&t.dir, path, "original\n");
+        }
+        git(&t.dir, &["add", "."]);
+        git(&t.dir, &["commit", "-qm", "files"]);
+        for path in [*name, "abc.txt"] {
+            write(&t.dir, path, "changed\n");
+        }
+        t.repo.stage(Path::new(name)).unwrap();
+        assert_eq!(t.repo.staged_count().unwrap(), 1, "{name}");
+        t.repo.unstage(Path::new(name)).unwrap();
+        assert_eq!(t.repo.staged_count().unwrap(), 0, "{name}");
+        let entries = t.repo.worktree_status(true).unwrap();
+        let selected = entries.iter().find(|e| e.path == Path::new(name)).unwrap();
+        t.repo.discard(selected).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(t.dir.join(name)).unwrap(),
+            "original\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(t.dir.join("abc.txt")).unwrap(),
+            "changed\n"
+        );
+    }
+}

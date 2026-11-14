@@ -145,19 +145,14 @@ fn hc_json(args: &[&str]) -> Result<Value> {
         call_limit(),
     )?;
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // hc may echo submitted notes in either output stream.
     log(format!(
-        "hc {} -> {} | {}{}",
-        crate::logx::clip(&format!("{args:?}")),
-        out.status,
-        crate::logx::clip(&stdout),
-        crate::logx::clip(&String::from_utf8_lossy(&out.stderr))
+        "hc {} -> {}",
+        args.first().unwrap_or(&""),
+        out.status
     ));
     if !out.status.success() {
-        bail!(
-            "hc {}: {}",
-            args.first().unwrap_or(&""),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        bail!("hc {} failed: {}", args.first().unwrap_or(&""), out.status);
     }
     Ok(serde_json::from_str(stdout.trim()).unwrap_or(Value::Null))
 }
